@@ -10,6 +10,7 @@ import {
   StyleSheet,
 } from "react-native";
 import { BleManager, Device } from "react-native-ble-plx";
+import { Buffer } from "buffer";
 
 const BLEInterface = () => {
   const [bleManager] = useState(new BleManager());
@@ -62,7 +63,8 @@ const BLEInterface = () => {
 
     console.log("Starting BLE scan...");
     setIsScanning(true);
-    setDevices([]);
+    setDevices([]); // Clear previously discovered devices
+    const discoveredDeviceIds = new Set(); // Track discovered device IDs
 
     bleManager.startDeviceScan(null, null, (error, device) => {
       if (error) {
@@ -71,14 +73,11 @@ const BLEInterface = () => {
         return;
       }
 
-      if (device && device.name) {
+      if (device && device.name && !discoveredDeviceIds.has(device.id)) {
+        // Log and add only new devices
         console.log("Discovered device:", device.name, device.id);
-        setDevices((prevDevices) => {
-          if (!prevDevices.find((d) => d.id === device.id)) {
-            return [...prevDevices, device];
-          }
-          return prevDevices;
-        });
+        discoveredDeviceIds.add(device.id); // Mark device as discovered
+        setDevices((prevDevices) => [...prevDevices, device]);
       }
     });
 
@@ -93,56 +92,64 @@ const BLEInterface = () => {
 
   const connectToDevice = async (device: Device) => {
     try {
-      if (connectedDevice) {
-        console.log(`Disconnecting from previously connected device: ${connectedDevice.name}`);
-        await disconnectDevice();
-      }
+      console.log(`Attempting to connect to device: ${device.name} (${device.id})`);
 
-      console.log("Checking if device is already connected...");
-      const isConnected = await bleManager.isDeviceConnected(device.id);
+      // Connect to the device
+      const connectedDevice = await device.connect();
+      console.log(`Successfully connected to device: ${connectedDevice.name} (${connectedDevice.id})`);
 
-      if (isConnected) {
-        console.log("Device is already connected. Skipping reconnection.");
-        setConnectedDevice(device);
-        return;
-      }
-
-      console.log("Connecting to device:", device.name);
-      const newConnectedDevice = await device.connect();
-      console.log("Connected to:", newConnectedDevice.name);
-      setConnectedDevice(newConnectedDevice);
-
-      await newConnectedDevice.requestMTU(250);
+      // Request MTU size
+      await connectedDevice.requestMTU(250);
       console.log("MTU size set to 250");
 
-      await newConnectedDevice.discoverAllServicesAndCharacteristics();
+      // Discover all services and characteristics
+      await connectedDevice.discoverAllServicesAndCharacteristics();
       console.log("Services and characteristics discovered");
 
-      // Read Battery Level
-      const batteryCharacteristic = await newConnectedDevice.readCharacteristicForService(
-        "180F", // Battery Service UUID
-        "2A19"  // Battery Level Characteristic UUID
-      );
-      const batteryLevel = parseInt(batteryCharacteristic.value || "0", 16);
-      console.log("Battery Level:", batteryLevel);
-
-      // Read Valve Status
-      const valveCharacteristic = await newConnectedDevice.readCharacteristicForService(
-        "005a02fe-bea5-46a0-c000-73c0d9b578fc", // DLMS/COSEM Interface UUID
-        "005a02fe-bea5-46a0-c101-73c0d9b578fc"  // Notify/Write Characteristic
-      );
-      console.log("Valve Status (Raw):", valveCharacteristic.value);
-
-      // Update device data
-      setDeviceData({
-        batteryLevel,
-        valveStatus: valveCharacteristic.value || "Unknown",
-      });
+      // Set connected device
+      setConnectedDevice(connectedDevice);
     } catch (error: any) {
-      console.error("Connection error:", error.message);
+      console.error(`Error connecting to device: ${device.id}`, error.message);
+      if (connectedDevice) {
+        console.warn("Cleaning up partial connection...");
+        await disconnectDevice(); // Ensure clean disconnection in case of failure
+      }
     }
   };
 
+  const fetchDeviceInformation = async (device: Device) => {
+    try {
+      const serviceUUID = "180A"; // Device Information Services
+      const characteristics = {
+        serialNumber: "2A25", // Serial Number
+        firmwareVersion: "2A26", // Firmware Version
+      };
+  
+      // Verify connection before reading characteristics
+      if (!(await device.isConnected())) {
+        console.warn("Device is not connected. Retrying...");
+        await device.connect();
+        await device.discoverAllServicesAndCharacteristics();
+      }
+  
+      const serialNumberChar = await device.readCharacteristicForService(serviceUUID, characteristics.serialNumber);
+      const firmwareVersionChar = await device.readCharacteristicForService(serviceUUID, characteristics.firmwareVersion);
+  
+      const serialNumber = Buffer.from(serialNumberChar.value || "", "base64").toString("utf-8");
+      const firmwareVersion = Buffer.from(firmwareVersionChar.value || "", "base64").toString("utf-8");
+  
+      console.log("Serial Number:", serialNumber);
+      console.log("Firmware Version:", firmwareVersion);
+  
+      setDeviceData({
+        serialNumber,
+        firmwareVersion,
+      });
+    } catch (error: any) {
+      console.error("Failed to fetch device information:", error.message);
+    }
+  };
+  
   const disconnectDevice = async () => {
     if (connectedDevice) {
       try {
@@ -178,8 +185,17 @@ const BLEInterface = () => {
       {connectedDevice ? (
         <View style={styles.deviceInfo}>
           <Text style={styles.title}>Connected to: {connectedDevice.name}</Text>
-          <Text>Battery Level: {deviceData?.batteryLevel || "Fetching..."}</Text>
-          <Text>Valve Status: {deviceData?.valveStatus || "Fetching..."}</Text>
+          {deviceData ? (
+            <View>
+              <Text>Serial Number: {deviceData.serialNumber || "N/A"}</Text>
+              <Text>Firmware Version: {deviceData.firmwareVersion || "N/A"}</Text>
+            </View>
+          ) : (
+            <Button
+              title="Fetch Device Info"
+              onPress={() => fetchDeviceInformation(connectedDevice)}
+            />
+          )}
           <Button title="Disconnect" onPress={disconnectDevice} />
         </View>
       ) : (
