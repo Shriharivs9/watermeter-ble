@@ -119,29 +119,68 @@ const BLEInterface = () => {
 
   const fetchDeviceInformation = async (device: Device) => {
     try {
-      const serviceUUID = "180A"; // Device Information Services
-      const characteristics = {
-        serialNumber: "2A25", // Serial Number
-        firmwareVersion: "2A26", // Firmware Version
+      const services = {
+        GAP: "1800",
+        DEVICE_INFO: "180A"
       };
-  
-      // Verify connection before reading characteristics
-      if (!(await device.isConnected())) {
-        console.warn("Device is not connected. Retrying...");
+      
+      const characteristics = {
+        // GAP characteristics
+        deviceName: "2A00",
+        appearance: "2A01",
+        // Device Info characteristics
+        serialNumber: "2A25",
+        firmwareVersion: "2A26",
+      };
+
+      console.log("Checking connection state...");
+      const isConnected = await device.isConnected();
+      console.log("Connection state:", isConnected ? "Connected" : "Disconnected");
+
+      if (!isConnected) {
+        console.log("Attempting to reconnect...");
         await device.connect();
         await device.discoverAllServicesAndCharacteristics();
+        console.log("Reconnection successful");
       }
-  
-      const serialNumberChar = await device.readCharacteristicForService(serviceUUID, characteristics.serialNumber);
-      const firmwareVersionChar = await device.readCharacteristicForService(serviceUUID, characteristics.firmwareVersion);
-  
+
+      console.log("Reading device characteristics...");
+      
+      // Read GAP characteristics
+      const deviceNameChar = await device.readCharacteristicForService(
+        services.GAP,
+        characteristics.deviceName
+      );
+      const appearanceChar = await device.readCharacteristicForService(
+        services.GAP,
+        characteristics.appearance
+      );
+
+      // Read Device Information characteristics
+      const serialNumberChar = await device.readCharacteristicForService(
+        services.DEVICE_INFO,
+        characteristics.serialNumber
+      );
+      const firmwareVersionChar = await device.readCharacteristicForService(
+        services.DEVICE_INFO,
+        characteristics.firmwareVersion
+      );
+
+      // Parse the values
+      const deviceName = Buffer.from(deviceNameChar.value || "", "base64").toString("utf-8");
+      const appearance = Buffer.from(appearanceChar.value || "", "base64").readUInt16LE(0);
       const serialNumber = Buffer.from(serialNumberChar.value || "", "base64").toString("utf-8");
       const firmwareVersion = Buffer.from(firmwareVersionChar.value || "", "base64").toString("utf-8");
-  
+
+      console.log("Successfully read characteristics");
+      console.log("Device Name:", deviceName);
+      console.log("Appearance:", appearance); // Will show numeric value (2 for Computer)
       console.log("Serial Number:", serialNumber);
       console.log("Firmware Version:", firmwareVersion);
-  
+
       setDeviceData({
+        deviceName,
+        appearance,
         serialNumber,
         firmwareVersion,
       });
