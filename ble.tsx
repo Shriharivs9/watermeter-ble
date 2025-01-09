@@ -121,31 +121,32 @@ const BLEInterface = () => {
     try {
       const services = {
         GAP: "1800",
-        DEVICE_INFO: "180A"
+        DEVICE_INFO: "180A",
+        // CURRENT_TIME: "1805",
+        DLMS_COSEM: "005a02fe-bea5-46a0-c000-73c0d9b578fc", // Metering Interface
       };
-      
+  
       const characteristics = {
-        // GAP characteristics
         deviceName: "2A00",
         appearance: "2A01",
-        // Device Info characteristics
         serialNumber: "2A25",
         firmwareVersion: "2A26",
+        // currentTime: "2A2B",
+        notifyWrite: "005a02fe-bea5-46a0-c101-73c0d9b578fc", // Notify/Write for DLMS
       };
 
+  
       console.log("Checking connection state...");
       const isConnected = await device.isConnected();
-      console.log("Connection state:", isConnected ? "Connected" : "Disconnected");
-
       if (!isConnected) {
         console.log("Attempting to reconnect...");
         await device.connect();
         await device.discoverAllServicesAndCharacteristics();
         console.log("Reconnection successful");
       }
-
+  
       console.log("Reading device characteristics...");
-      
+  
       // Read GAP characteristics
       const deviceNameChar = await device.readCharacteristicForService(
         services.GAP,
@@ -155,7 +156,7 @@ const BLEInterface = () => {
         services.GAP,
         characteristics.appearance
       );
-
+  
       // Read Device Information characteristics
       const serialNumberChar = await device.readCharacteristicForService(
         services.DEVICE_INFO,
@@ -166,26 +167,86 @@ const BLEInterface = () => {
         characteristics.firmwareVersion
       );
 
-      // Parse the values
+      // const CurrentTime = await device.readCharacteristicForService(
+      //   services.CURRENT_TIME,
+      //   characteristics.currentTime
+      // )
+  
+      // Parse the standard information
       const deviceName = Buffer.from(deviceNameChar.value || "", "base64").toString("utf-8");
       const appearance = Buffer.from(appearanceChar.value || "", "base64").readUInt16LE(0);
       const serialNumber = Buffer.from(serialNumberChar.value || "", "base64").toString("utf-8");
       const firmwareVersion = Buffer.from(firmwareVersionChar.value || "", "base64").toString("utf-8");
-
+      // const CurrentTimeofDevice = Buffer.from(CurrentTime.value || "", "base64").toString("utf-8");
+  
       console.log("Successfully read characteristics");
       console.log("Device Name:", deviceName);
-      console.log("Appearance:", appearance); // Will show numeric value (2 for Computer)
+      console.log("Appearance:", appearance);
       console.log("Serial Number:", serialNumber);
       console.log("Firmware Version:", firmwareVersion);
-
+      // console.log("Current Time:", CurrentTimeofDevice);
+  
+      // Retrieve Battery Voltage using DLMS COSEM
+      console.log("Requesting battery voltage...");
+      const obisCode = "000b600603ff"; // OBIS code for Battery Voltage (0.b.96.6.3)
+      const dlmsRequest = `C001${obisCode}`; // DLMS Get Request with OBIS Code
+      const data = await device.writeCharacteristicWithoutResponseForService(
+        services.DLMS_COSEM,
+        characteristics.notifyWrite,
+        Buffer.from(dlmsRequest, "hex").toString("base64")
+      );
+  
+      console.log("Battery Voltage request sent",data);
+  
+      const subscription = bleManager.monitorCharacteristicForDevice(
+        device.id,
+        services.DLMS_COSEM,
+        characteristics.notifyWrite,
+        (error:any, characteristic:any) => {
+          if (error) {
+            console.error("Error receiving battery voltage:", error.message);
+            return;
+          }
+  
+          const decodedValue = Buffer.from(characteristic.value, "base64");
+          console.log("Decoded value for battery voltage:", decodedValue);
+  
+          const batteryVoltage = parseBatteryVoltage(decodedValue);
+          console.log("Battery Voltage:", batteryVoltage);
+  
+          setDeviceData((prevData:any) => ({
+            ...prevData,
+            batteryVoltage,
+          }));
+        }
+      );
+  
+      console.log("Battery Voltage subscription active");
+  
       setDeviceData({
         deviceName,
         appearance,
         serialNumber,
         firmwareVersion,
       });
-    } catch (error: any) {
+  
+      // Clean up the subscription
+      return () => subscription.remove();
+    } catch (error:any) {
       console.error("Failed to fetch device information:", error.message);
+    }
+  };
+  
+  // Parse Battery Voltage from DLMS Response
+  const parseBatteryVoltage = (decodedValue:any) => {
+    try {
+      // Assuming battery voltage is stored as an unsigned integer starting at a specific offset
+      const batteryVoltageRaw = decodedValue.readUInt32BE(0); // Adjust the offset based on DLMS response
+      const batteryVoltage = batteryVoltageRaw / 1000; // Convert millivolts to volts
+      return batteryVoltage;
+    } catch (error:any) {
+      console.error("Failed to parse battery voltage:", error.message);
+      return null;
     }
   };
   
