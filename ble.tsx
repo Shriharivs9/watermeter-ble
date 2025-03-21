@@ -18,6 +18,7 @@ const BLEInterface = () => {
   const [devices, setDevices] = useState<Device[]>([]);
   const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
   const [deviceData, setDeviceData] = useState<any>(null);
+  const [packetSequence, setPacketSequence] = useState<number>(0x40); // Start from 0x41 (65 decimal)
 
   useEffect(() => {
     if (Platform.OS === "android") {
@@ -99,10 +100,10 @@ const BLEInterface = () => {
       console.log(`Successfully connected to device: ${connectedDevice.name} (${connectedDevice.id})`);
 
       // Request MTU size
-      await connectedDevice.requestMTU(250);
-      console.log("MTU size set to 250");
+      const mtu = await connectedDevice.requestMTU(247);
+      console.log(`Negotiated MTU: ${mtu}`);
 
-      // Discover all services and characteristics
+      // Wait for service discovery to complete
       await connectedDevice.discoverAllServicesAndCharacteristics();
       console.log("Services and characteristics discovered");
 
@@ -112,83 +113,179 @@ const BLEInterface = () => {
       console.error(`Error connecting to device: ${device.id}`, error.message);
       if (connectedDevice) {
         console.warn("Cleaning up partial connection...");
-        await disconnectDevice(); // Ensure clean disconnection in case of failure
+        await disconnectDevice();
       }
     }
   };
 
   const fetchDeviceInformation = async (device: Device) => {
     try {
-      const services = {
-        GAP: "1800",
-        DEVICE_INFO: "180A"
-      };
-      
-      const characteristics = {
-        // GAP characteristics
-        deviceName: "2A00",
-        appearance: "2A01",
-        // Device Info characteristics
-        serialNumber: "2A25",
-        firmwareVersion: "2A26",
+      const serviceUUID = "005a02fe-bea5-46a0-c000-73c0d9b578fc";
+      const characteristicUUID = "005a02fe-bea5-46a0-c101-73c0d9b578fc";
+
+      // Only implement battery voltage request for now
+      const request = {
+        name: 'BatteryVoltage',
+        obisCode: '3:0-0:96.6.3*255:2',
+        requestPacket: createDLMSRequest('3:0-0:96.6.3*255:2')
       };
 
-      console.log("Checking connection state...");
-      const isConnected = await device.isConnected();
-      console.log("Connection state:", isConnected ? "Connected" : "Disconnected");
+      try {
+        if (!(await device.isConnected())) {
+          console.log("Device disconnected, reconnecting...");
+          await device.connect();
+          await device.discoverAllServicesAndCharacteristics();
+          console.log("Reconnected successfully");
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
 
-      if (!isConnected) {
-        console.log("Attempting to reconnect...");
-        await device.connect();
-        await device.discoverAllServicesAndCharacteristics();
-        console.log("Reconnection successful");
+        console.log(`Sending battery voltage request`);
+        
+        // Convert request to base64
+        const base64Request = Buffer.from(request.requestPacket).toString('base64');
+        
+        // Enable notifications first
+        await device.monitorCharacteristicForService(
+          serviceUUID,
+          characteristicUUID,
+          (error, characteristic) => {
+            if (error) {
+              console.error(`Notification error:`, error);
+              return;
+            }
+            if (characteristic?.value) {
+              const responseData = Buffer.from(characteristic.value, 'base64');
+              console.log(`Received notification:`, responseData.toString('hex'));
+              parseResponse(responseData, request.name);
+            }
+          }
+        );
+
+        // Write the request
+        await device.writeCharacteristicWithResponseForService(
+          serviceUUID,
+          characteristicUUID,
+          base64Request
+        );
+
+        // Wait for response
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+      } catch (error) {
+        console.error(`Error handling battery voltage request:`, error);
       }
+    } catch (error) {
+      console.error("Error fetching device information:", error);
+    }
+  };
 
-      console.log("Reading device characteristics...");
+  const createDLMSRequest = (obisCode: string): Buffer => {
+    if (obisCode === '3:0-0:96.6.3*255:2') { // Battery Voltage request
+      // Only the value payload as seen in the sniffer
+      const packet = Buffer.from([
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x0d,
+        0xc0, 0x01, packetSequence, 0x00, 0x03, 0x00, 0x00, 0x60,
+        0x06, 0x03, 0xff, 0x02, 0x00
+      ]);
+
+      //000100010001000dc0014000030000600603ff0200
+
+      console.log(`Created battery voltage request packet (sequence 0x${packetSequence.toString(16)}):`, packet.toString('hex'));
       
-      // Read GAP characteristics
-      const deviceNameChar = await device.readCharacteristicForService(
-        services.GAP,
-        characteristics.deviceName
-      );
-      const appearanceChar = await device.readCharacteristicForService(
-        services.GAP,
-        characteristics.appearance
-      );
-
-      // Read Device Information characteristics
-      const serialNumberChar = await device.readCharacteristicForService(
-        services.DEVICE_INFO,
-        characteristics.serialNumber
-      );
-      const firmwareVersionChar = await device.readCharacteristicForService(
-        services.DEVICE_INFO,
-        characteristics.firmwareVersion
-      );
-
-      // Parse the values
-      const deviceName = Buffer.from(deviceNameChar.value || "", "base64").toString("utf-8");
-      const appearance = Buffer.from(appearanceChar.value || "", "base64").readUInt16LE(0);
-      const serialNumber = Buffer.from(serialNumberChar.value || "", "base64").toString("utf-8");
-      const firmwareVersion = Buffer.from(firmwareVersionChar.value || "", "base64").toString("utf-8");
-
-      console.log("Successfully read characteristics");
-      console.log("Device Name:", deviceName);
-      console.log("Appearance:", appearance); // Will show numeric value (2 for Computer)
-      console.log("Serial Number:", serialNumber);
-      console.log("Firmware Version:", firmwareVersion);
-
-      setDeviceData({
-        deviceName,
-        appearance,
-        serialNumber,
-        firmwareVersion,
+      // Increment sequence for next request
+      setPacketSequence(prev => {
+        const next = prev + 1;
+        return next > 0xFF ? 0x41 : next; // Wrap around to 0x41 if we exceed 0xFF
       });
-    } catch (error: any) {
-      console.error("Failed to fetch device information:", error.message);
+
+      return packet;
+    }
+    
+    throw new Error('Unsupported OBIS code');
+  };
+
+  const calculateCRC = (data: Buffer): Buffer => {
+    // CRC-16/X-25 implementation based on sniffed packets
+    let crc = 0xFFFF;
+    for (let i = 0; i < data.length; i++) {
+      crc ^= data[i];
+      for (let j = 0; j < 8; j++) {
+        if ((crc & 0x0001) !== 0) {
+          crc = (crc >> 1) ^ 0x8408;
+        } else {
+          crc = crc >> 1;
+        }
+      }
+    }
+    crc = ~crc;
+    return Buffer.from([crc & 0xFF, (crc >> 8) & 0xFF]);
+  };
+
+  const parseResponse = (responseData: Buffer, requestName: string) => {
+    try {
+      console.log(`Parsing ${requestName} response:`, {
+        rawData: responseData.toString('hex'),
+        length: responseData.length
+      });
+
+      // Extract the actual data from the DLMS response
+      const dataValue = extractDataFromDLMSResponse(responseData, requestName);
+      console.log(`Extracted ${requestName} value:`, dataValue);
+
+      setDeviceData((prevData:any) => ({
+        ...prevData,
+        [requestName.toLowerCase()]: dataValue
+      }));
+
+    } catch (error) {
+      console.error(`Error parsing ${requestName} response:`, error);
+    }
+  };
+
+  const extractDataFromDLMSResponse = (data: Buffer, requestName: string): string => {
+    try {
+      if (requestName === 'BatteryVoltage') {
+        // Log full response for debugging
+        const responseHex = data.toString('hex');
+        console.log('Raw response:', responseHex);
+        
+        // Convert buffer to byte array
+        const bytes = Array.from(data);
+        
+        // Find the sequence that indicates the start of the voltage value
+        // In the response, we look for 0x03 which precedes the voltage bytes
+        const voltageIndex = bytes.findIndex((byte, index) => 
+          byte === 0x03 && index + 2 < bytes.length
+        );
+
+        if (voltageIndex !== -1) {
+          // Get the two bytes after 0x03
+          const d8Value = bytes[voltageIndex + 1].toString(16).padStart(2, '0');  // d8
+          const nextValue = bytes[voltageIndex + 2].toString(16).padStart(2, '0'); // 01
+          
+          console.log(`Found bytes: 0x${d8Value} 0x${nextValue}`);
+          
+          // Combine d8 and first digit of 01 to make d81
+          const voltageStr = d8Value + nextValue[0];  // d81
+          const voltageValue = parseInt(voltageStr, 16);  // Convert hex d81 to decimal 3457
+          
+          // Format as voltage with 3 decimal places
+          const voltage = (voltageValue / 1000).toFixed(3);
+          
+          console.log(`Voltage string: ${voltageStr}, Raw value: ${voltageValue}, Final voltage: ${voltage}V`);
+          return voltage + " V";
+        }
+      }
+      
+      return 'Unable to parse response';
+    } catch (error) {
+      console.error('Error extracting data:', error);
+      return 'Error parsing response';
     }
   };
   
+  
+
   const disconnectDevice = async () => {
     if (connectedDevice) {
       try {
@@ -226,8 +323,9 @@ const BLEInterface = () => {
           <Text style={styles.title}>Connected to: {connectedDevice.name}</Text>
           {deviceData ? (
             <View>
-              <Text>Serial Number: {deviceData.serialNumber || "N/A"}</Text>
-              <Text>Firmware Version: {deviceData.firmwareVersion || "N/A"}</Text>
+              <Text>Battery Voltage: {deviceData.batteryvoltage || "N/A"}</Text>
+              <Text>Valve Status: {deviceData.valvestatus || "N/A"}</Text>
+              <Text>Serial Number: {deviceData.serialnumber || "N/A"}</Text>
             </View>
           ) : (
             <Button
